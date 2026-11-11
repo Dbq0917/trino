@@ -14,13 +14,13 @@
 package io.trino.plugin.base.util;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.core.StreamReadConstraints;
-import com.fasterxml.jackson.core.util.JsonRecyclerPools;
-import com.fasterxml.jackson.databind.JsonNode;
 import org.junit.jupiter.api.Test;
+import tools.jackson.core.JacksonException;
+import tools.jackson.core.StreamReadConstraints;
+import tools.jackson.core.util.JsonRecyclerPools;
+import tools.jackson.databind.JsonNode;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 
 import static io.trino.plugin.base.util.JsonUtils.jsonFactory;
 import static io.trino.plugin.base.util.JsonUtils.jsonFactoryBuilder;
@@ -57,21 +57,17 @@ public class TestJsonUtils
     {
         // parseJson(String)
         assertThatThrownBy(() -> parseJson("{} {}}", JsonNode.class))
-                .isInstanceOf(UncheckedIOException.class)
-                .hasMessage("Could not parse JSON");
+                .isInstanceOf(JacksonException.class);
         assertThatThrownBy(() -> parseJson("{} not even a JSON here", JsonNode.class))
-                .isInstanceOf(UncheckedIOException.class)
-                .hasMessage("Could not parse JSON")
-                .hasStackTraceContaining("Unrecognized token 'not': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')");
+                .isInstanceOf(JacksonException.class)
+                .hasMessageContaining("Unrecognized token 'not': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')");
 
         // parseJson(byte[], Class)
         assertThatThrownBy(() -> parseJson("{} {}}".getBytes(US_ASCII), TestObject.class))
-                .isInstanceOf(UncheckedIOException.class)
-                .hasMessage("Could not parse JSON");
+                .isInstanceOf(JacksonException.class);
         assertThatThrownBy(() -> parseJson("{} not even a JSON here".getBytes(US_ASCII), TestObject.class))
-                .isInstanceOf(UncheckedIOException.class)
-                .hasMessage("Could not parse JSON")
-                .hasStackTraceContaining("Unrecognized token 'not': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')");
+                .isInstanceOf(JacksonException.class)
+                .hasMessageContaining("Unrecognized token 'not': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')");
     }
 
     @Test

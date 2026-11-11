@@ -17,13 +17,17 @@ package io.trino.plugin.deltalake.transactionlog;
 import io.trino.filesystem.TrinoFileSystem;
 import io.trino.spi.type.LongTimestampWithTimeZone;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Optional;
 
 import static io.trino.hdfs.HdfsTestUtils.HDFS_FILE_SYSTEM_FACTORY;
 import static io.trino.plugin.deltalake.DeltaTestingConnectorSession.SESSION;
 import static io.trino.plugin.deltalake.transactionlog.TransactionLogParser.findLatestCommitVersion;
 import static io.trino.plugin.deltalake.transactionlog.TransactionLogParser.getMandatoryCurrentVersion;
+import static io.trino.plugin.deltalake.transactionlog.TransactionLogParser.readLastCheckpoint;
 import static io.trino.plugin.deltalake.transactionlog.TransactionLogParser.readPartitionTimestampWithZone;
 import static io.trino.plugin.deltalake.transactionlog.TransactionLogParser.readVersionChecksumFile;
 import static io.trino.spi.type.TimeZoneKey.UTC_KEY;
@@ -157,5 +161,16 @@ public class TestTransactionLogParser
         String tableLocation = getClass().getClassLoader().getResource("deltalake/checksum_trailing_json_content").toURI().toString();
 
         assertThat(readVersionChecksumFile(fileSystem, tableLocation, 1)).isEmpty();
+    }
+
+    @Test
+    public void testReadMalformedLastCheckpoint(@TempDir Path tempDir)
+            throws Exception
+    {
+        TrinoFileSystem fileSystem = HDFS_FILE_SYSTEM_FACTORY.create(SESSION);
+        Path transactionLogDir = Files.createDirectories(tempDir.resolve("_delta_log"));
+        Files.writeString(transactionLogDir.resolve("_last_checkpoint"), "{\"version\": 10, \"size\":");
+
+        assertThat(readLastCheckpoint(fileSystem, tempDir.toUri().toString())).isEmpty();
     }
 }
