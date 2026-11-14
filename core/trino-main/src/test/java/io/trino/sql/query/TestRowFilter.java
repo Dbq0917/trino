@@ -160,6 +160,10 @@ public class TestRowFilter
                 new QualifiedObjectName(LOCAL_CATALOG, "tiny", "orders"),
                 USER,
                 ViewExpression.builder().expression("orderkey < 10").build());
+        accessControl.rowFilter(
+                new QualifiedObjectName(MOCK_CATALOG, "default", "nation_view"),
+                USER,
+                ViewExpression.builder().catalog(LOCAL_CATALOG).schema("tiny").expression("nationkey < 5").build());
         assertThat(assertions.query("SELECT count(*) FROM orders")).matches("VALUES BIGINT '7'");
 
         accessControl.reset();
@@ -218,6 +222,90 @@ public class TestRowFilter
                         .expression("EXISTS (SELECT 1 FROM nation WHERE nationkey = orderkey)")
                         .build());
         assertThat(assertions.query("SELECT count(*) FROM orders")).matches("VALUES BIGINT '7'");
+    }
+
+    @Test
+    public void testSubqueryForms()
+    {
+        accessControl.reset();
+        accessControl.rowFilter(
+                new QualifiedObjectName(LOCAL_CATALOG, "tiny", "orders"),
+                USER,
+                ViewExpression.builder().expression("orderkey < 10").build());
+        accessControl.rowFilter(
+                new QualifiedObjectName(MOCK_CATALOG, "default", "nation_view"),
+                USER,
+                ViewExpression.builder().catalog(LOCAL_CATALOG).schema("tiny").expression("nationkey < 5").build());
+
+        assertThat(assertions.query("SELECT count(*) FROM (SELECT * FROM orders)")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("WITH t AS (SELECT * FROM orders) SELECT count(*) FROM t")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("SELECT count(*) FROM (SELECT (SELECT count(*) FROM orders) FROM orders)")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("SELECT count(*) FROM orders WHERE orderkey IN (SELECT orderkey FROM orders)")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("SELECT count(*) FROM orders o WHERE EXISTS (SELECT 1 FROM orders i WHERE i.orderkey = o.orderkey)")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("SELECT count(*) FROM orders WHERE orderkey IN (SELECT orderkey FROM (SELECT * FROM orders))")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("SELECT count(*) FROM orders WHERE orderkey IN (SELECT orderkey FROM orders UNION ALL SELECT orderkey FROM orders)")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("SELECT count(*) FROM (SELECT * FROM orders UNION ALL SELECT * FROM orders)")).matches("VALUES BIGINT '14'");
+        assertThat(assertions.query("SELECT count(*) FROM orders o JOIN (SELECT * FROM orders) i USING (orderkey)")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("SELECT count(*) FROM orders o WHERE NOT EXISTS (SELECT 1 FROM orders i WHERE i.orderkey > o.orderkey)")).matches("VALUES BIGINT '1'");
+        assertThat(assertions.query("SELECT count(*) FROM orders o WHERE orderkey + 10 IN (SELECT orderkey FROM orders)")).matches("VALUES BIGINT '0'");
+        assertThat(assertions.query("SELECT sum(c) FROM (SELECT orderkey, (SELECT count(*) FROM orders i WHERE i.orderkey > o.orderkey) AS c FROM orders o)")).matches("VALUES BIGINT '21'");
+        assertThat(assertions.query("SELECT count(*) FROM (SELECT * FROM orders ORDER BY orderkey OFFSET 5)")).matches("VALUES BIGINT '2'");
+        assertThat(assertions.query("SELECT count(*) FROM (SELECT orderkey AS custkey FROM orders)")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("SELECT count(*) FROM orders o JOIN orders i ON i.orderkey = o.orderkey + 10")).matches("VALUES BIGINT '0'");
+        assertThat(assertions.query("SELECT count(*) FROM orders o, LATERAL (SELECT * FROM orders i WHERE i.orderkey > o.orderkey)")).matches("VALUES BIGINT '21'");
+        assertThat(assertions.query("SELECT count(*) FROM (SELECT count(*) FROM orders GROUP BY orderkey HAVING orderkey IN (SELECT orderkey FROM orders))")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("SELECT count(*) FROM orders o WHERE o.orderkey = (SELECT max(orderkey) FROM orders)")).matches("VALUES BIGINT '1'");
+        assertThat(assertions.query("SELECT count(*) FROM orders o WHERE (SELECT count(*) FROM orders i WHERE i.orderkey > o.orderkey) = 0")).matches("VALUES BIGINT '1'");
+        assertThat(assertions.query("SELECT name FROM mock.default.nation_view")).matches("VALUES CAST('ALGERIA' AS VARCHAR(25)), CAST('ARGENTINA' AS VARCHAR(25)), CAST('BRAZIL' AS VARCHAR(25)), CAST('CANADA' AS VARCHAR(25)), CAST('EGYPT' AS VARCHAR(25))");
+        assertThat(assertions.query("SELECT count(*) FROM mock.default.nation_view")).matches("VALUES BIGINT '5'");
+        assertThat(assertions.query("SELECT count(*) FROM mock.default.nation_view v WHERE v.nationkey IN (SELECT nationkey FROM mock.default.nation_view)")).matches("VALUES BIGINT '5'");
+    }
+
+    @Test
+    public void testViewFilterProbe()
+    {
+        accessControl.reset();
+        accessControl.rowFilter(
+                new QualifiedObjectName(LOCAL_CATALOG, "tiny", "orders"),
+                USER,
+                ViewExpression.builder().expression("orderkey < 10").build());
+        accessControl.rowFilter(
+                new QualifiedObjectName(MOCK_CATALOG, "default", "nation_view"),
+                USER,
+                ViewExpression.builder().catalog(LOCAL_CATALOG).schema("tiny").expression("nationkey < 5").build());
+
+        assertThat(assertions.query("SELECT name FROM mock.default.nation_view")).matches("VALUES CAST('ALGERIA' AS VARCHAR(25)), CAST('ARGENTINA' AS VARCHAR(25)), CAST('BRAZIL' AS VARCHAR(25)), CAST('CANADA' AS VARCHAR(25)), CAST('EGYPT' AS VARCHAR(25))");
+    }
+
+    @Test
+    public void testViewUnderlyingFilterProbe()
+    {
+        accessControl.reset();
+        accessControl.rowFilter(
+                new QualifiedObjectName(LOCAL_CATALOG, "tiny", "nation"),
+                VIEW_OWNER,
+                ViewExpression.builder().catalog(LOCAL_CATALOG).schema("tiny").expression("nationkey < 5").build());
+
+        assertThat(assertions.query("SELECT name FROM mock.default.nation_view")).matches("VALUES CAST('ALGERIA' AS VARCHAR(25)), CAST('ARGENTINA' AS VARCHAR(25)), CAST('BRAZIL' AS VARCHAR(25)), CAST('CANADA' AS VARCHAR(25)), CAST('EGYPT' AS VARCHAR(25))");
+        assertThat(assertions.query("SELECT count(*) FROM mock.default.nation_view v WHERE v.nationkey IN (SELECT nationkey FROM mock.default.nation_view)")).matches("VALUES BIGINT '5'");
+    }
+
+    @Test
+    public void testFilterWithSubqueryAndUserSubquery()
+    {
+        accessControl.reset();
+        accessControl.rowFilter(
+                new QualifiedObjectName(LOCAL_CATALOG, "tiny", "orders"),
+                USER,
+                ViewExpression.builder()
+                        .catalog(LOCAL_CATALOG)
+                        .schema("tiny")
+                        .expression("EXISTS (SELECT 1 FROM nation WHERE nationkey = orderkey)")
+                        .build());
+
+        assertThat(assertions.query("SELECT count(*) FROM orders")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("SELECT count(*) FROM orders o WHERE o.orderkey IN (SELECT orderkey FROM orders i)")).matches("VALUES BIGINT '7'");
+        assertThat(assertions.query("SELECT count(*) FROM orders o WHERE NOT EXISTS (SELECT 1 FROM orders i WHERE i.orderkey > o.orderkey)")).matches("VALUES BIGINT '1'");
     }
 
     @Test
