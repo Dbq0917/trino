@@ -184,6 +184,7 @@ import static com.google.common.collect.Iterables.getOnlyElement;
 import static io.trino.SystemSessionProperties.QUERY_MAX_INITIAL_PLAN_NODES;
 import static io.trino.SystemSessionProperties.getCharVarcharCoercion;
 import static io.trino.SystemSessionProperties.getQueryMaxInitialPlanNodes;
+import static io.trino.SystemSessionProperties.isLegacyOuterJoinSubqueryPredicateBehavior;
 import static io.trino.spi.StandardErrorCode.CONSTRAINT_VIOLATION;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.StandardErrorCode.QUERY_PLAN_TOO_LARGE;
@@ -1082,13 +1083,10 @@ class RelationPlanner
 
                 // This is for handling uncorreled subqueries. Correlated subqueries are not currently supported and are dealt with
                 // during analysis.
-                // Make best effort to plan the subquery in the branch of the join involving the other inputs to the expression.
-                // E.g.,
-                //  t JOIN u ON t.x = (...) get's planned on the t side
-                //  t JOIN u ON t.x = (...) get's planned on the u side
-                //  t JOIN u ON t.x + u.x = (...) get's planned on an arbitrary side
-                RelationType side = dependencies.stream().allMatch(left::canResolve) ? left : right;
-                verifySubqueryPredicateOperandsResolvable(type, complexExpression, side, subqueries);
+                // Plan each subquery predicate on the join branch that can resolve the columns referenced by
+                // its operand. This makes LEFT and RIGHT joins behave symmetrically: a predicate whose operand
+                // only references the left table can be planned on the left branch of either join.
+                RelationType side = chooseOuterJoinSubquerySide(type, complexExpression, dependencies, left, right, subqueries);
                 if (side == left) {
                     leftPlanBuilder = subqueryPlanner.handleSubqueries(leftPlanBuilder, complexExpression, subqueries);
                 }
@@ -1142,17 +1140,93 @@ class RelationPlanner
         return new RelationPlan(root, scope, outputSymbols, outerContext);
     }
 
-    private void verifySubqueryPredicateOperandsResolvable(Join.Type type, io.trino.sql.tree.Expression expression, RelationType side, Analysis.SubqueryAnalysis subqueries)
+    private RelationType chooseOuterJoinSubquerySide(
+            Join.Type type,
+            io.trino.sql.tree.Expression expression,
+            Set<QualifiedName> expressionDependencies,
+            RelationType left,
+            RelationType right,
+            Analysis.SubqueryAnalysis subqueries)
     {
+        RelationType historicalSide = expressionDependencies.stream().allMatch(left::canResolve) ? left : right;
+        if (subqueries.getInPredicates().isEmpty()
+                && subqueries.getQuantifiedComparisons().isEmpty()
+                && subqueries.getMatchPredicates().isEmpty()) {
+            return historicalSide;
+        }
+
         Set<Node> nodes = AstUtils.preOrder(expression).collect(toCollection(() -> newSetFromMap(new IdentityHashMap<>())));
-        Stream.of(subqueries.getInPredicates(), subqueries.getQuantifiedComparisons(), subqueries.getMatchPredicates())
+        List<Analysis.OperandAndPredicate> subqueryPredicates = Stream.of(subqueries.getInPredicates(), subqueries.getQuantifiedComparisons(), subqueries.getMatchPredicates())
                 .flatMap(List::stream)
                 .filter(predicate -> nodes.contains(predicate.predicate()))
-                .filter(predicate -> !NamesExtractor.extractNamesNoSubqueries(predicate.operand(), analysis.getColumnReferences()).stream().allMatch(side::canResolve))
-                .findFirst()
-                .ifPresent(predicate -> {
-                    throw semanticException(NOT_SUPPORTED, predicate.operand(), "Subquery predicate in %s JOIN criteria involving both sides of the join is not supported", type.name());
-                });
+                .collect(toImmutableList());
+
+        if (isLegacyOuterJoinSubqueryPredicateBehavior(session)) {
+            // Legacy behavior: the whole criteria expression is planned on one fixed side, chosen from the
+            // outer column references of the expression. A subquery predicate whose operand needs the other
+            // side cannot be planned there, so the query is rejected up front instead of failing validation.
+            subqueryPredicates.stream()
+                    .filter(predicate -> !operandResolvesOnSide(predicate, historicalSide))
+                    .findFirst()
+                    .ifPresent(predicate -> {
+                        throw unsupportedMixedSideSubqueryPredicate(type, historicalSide == left ? "left" : "right", predicate);
+                    });
+            return historicalSide;
+        }
+
+        if (subqueryPredicates.isEmpty()) {
+            // No subquery predicate to unnest: keep the historical side choice so plans for plain outer join
+            // criteria remain byte-for-byte unchanged.
+            return historicalSide;
+        }
+
+        // Each subquery predicate must be unnested on the join side that can resolve its operand. A predicate
+        // whose operand references columns from both sides cannot be evaluated below either side of the join.
+        boolean allResolveOnLeft = subqueryPredicates.stream().allMatch(predicate -> operandResolvesOnSide(predicate, left));
+        boolean allResolveOnRight = subqueryPredicates.stream().allMatch(predicate -> operandResolvesOnSide(predicate, right));
+        if (!allResolveOnLeft && !allResolveOnRight) {
+            Optional<Analysis.OperandAndPredicate> mixedOperandPredicate = subqueryPredicates.stream()
+                    .filter(predicate -> !operandResolvesOnSide(predicate, left) && !operandResolvesOnSide(predicate, right))
+                    .findFirst();
+            if (mixedOperandPredicate.isPresent()) {
+                throw unsupportedMixedSideSubqueryPredicate(type, null, mixedOperandPredicate.get());
+            }
+            throw semanticException(
+                    NOT_SUPPORTED,
+                    subqueryPredicates.get(0).operand(),
+                    "Subquery predicates in %s JOIN criteria must be resolvable on the same join side, but they reference different sides",
+                    type.name());
+        }
+
+        // Prefer the side that resolves every operand. When both sides qualify (e.g. uncorrelated subqueries),
+        // fall back to the historical dependency-based choice to avoid changing existing plans.
+        if (allResolveOnLeft && allResolveOnRight) {
+            return historicalSide;
+        }
+        return allResolveOnLeft ? left : right;
+    }
+
+    private boolean operandResolvesOnSide(Analysis.OperandAndPredicate predicate, RelationType side)
+    {
+        return NamesExtractor.extractNamesNoSubqueries(predicate.operand(), analysis.getColumnReferences()).stream()
+                .allMatch(side::canResolve);
+    }
+
+    private TrinoException unsupportedMixedSideSubqueryPredicate(Join.Type type, @Nullable String side, Analysis.OperandAndPredicate predicate)
+    {
+        if (side == null) {
+            return semanticException(
+                    NOT_SUPPORTED,
+                    predicate.operand(),
+                    "Subquery predicate in %s JOIN criteria has an operand referencing both sides of the join and cannot be evaluated on either side",
+                    type.name());
+        }
+        return semanticException(
+                NOT_SUPPORTED,
+                predicate.operand(),
+                "Subquery predicate in %s JOIN criteria has an operand that cannot be resolved on the %s side of the join, where the join criteria is planned",
+                type.name(),
+                side);
     }
 
     private Expression translateComparison(ComparisonPredicate.Operator operator, Symbol left, Symbol right)

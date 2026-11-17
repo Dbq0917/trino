@@ -15,6 +15,7 @@ package io.trino.sql.query;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import io.trino.Session;
 import io.trino.sql.ir.Constant;
 import io.trino.sql.planner.plan.JoinNode;
 import org.junit.jupiter.api.AfterAll;
@@ -24,6 +25,7 @@ import org.junit.jupiter.api.parallel.Execution;
 
 import java.util.List;
 
+import static io.trino.SystemSessionProperties.LEGACY_OUTER_JOIN_SUBQUERY_PREDICATE_BEHAVIOR;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.VarcharType.VARCHAR;
 import static io.trino.sql.planner.assertions.PlanMatchPattern.aggregation;
@@ -304,25 +306,87 @@ public class TestJoin
                 .matches("VALUES (1, 1), (2, 3)");
 
         assertThat(assertions.query("SELECT * FROM (VALUES 1, 2) t(x) LEFT JOIN (VALUES 1, 3) u(x) ON t.x + u.x IN (VALUES 2, 5)"))
-                .failure().hasMessage("line 1:70: Subquery predicate in LEFT JOIN criteria involving both sides of the join is not supported");
+                .failure().hasMessageMatching("line 1:70: Subquery predicate in LEFT JOIN criteria has an operand referencing both sides of the join.*");
 
         assertThat(assertions.query("SELECT * FROM (VALUES 1, 2) t(x) RIGHT JOIN (VALUES 1, 3) u(x) ON t.x + u.x IN (VALUES 2, 5)"))
-                .failure().hasMessage("line 1:71: Subquery predicate in RIGHT JOIN criteria involving both sides of the join is not supported");
+                .failure().hasMessageMatching("line 1:71: Subquery predicate in RIGHT JOIN criteria has an operand referencing both sides of the join.*");
 
         assertThat(assertions.query("SELECT * FROM (VALUES 1, 2) t(x) FULL JOIN (VALUES 1, 3) u(x) ON t.x + u.x IN (VALUES 2, 5)"))
-                .failure().hasMessage("line 1:70: Subquery predicate in FULL JOIN criteria involving both sides of the join is not supported");
+                .failure().hasMessageMatching("line 1:70: Subquery predicate in FULL JOIN criteria has an operand referencing both sides of the join.*");
 
         assertThat(assertions.query("SELECT * FROM (VALUES 1, 2) t(x) LEFT JOIN (VALUES 1, 3) u(x) ON t.x + u.x = ANY (VALUES 2, 5)"))
-                .failure().hasMessage("line 1:70: Subquery predicate in LEFT JOIN criteria involving both sides of the join is not supported");
+                .failure().hasMessageMatching("line 1:70: Subquery predicate in LEFT JOIN criteria has an operand referencing both sides of the join.*");
 
         assertThat(assertions.query("SELECT * FROM (VALUES 1, 2) t(x) LEFT JOIN (VALUES 1, 3) u(x) ON u.x IN (VALUES 3) OR t.x = 1"))
                 .matches("VALUES (1, 1), (1, 3), (2, 3)");
 
         assertThat(assertions.query("SELECT * FROM (VALUES 1, 2) t(x) LEFT JOIN (VALUES 1, 3) u(x) ON t.x IN (VALUES 2) OR u.x = 1"))
-                .failure().hasMessage("line 1:66: Subquery predicate in LEFT JOIN criteria involving both sides of the join is not supported");
+                .matches("VALUES (1, 1), (2, 1), (2, 3)");
 
         assertThat(assertions.query("SELECT * FROM (VALUES 1, 2) t(x) RIGHT JOIN (VALUES 1, 3) u(x) ON t.x IN (VALUES 2) OR u.x = 1"))
-                .failure().hasMessage("line 1:67: Subquery predicate in RIGHT JOIN criteria involving both sides of the join is not supported");
+                .matches("VALUES (1, 1), (2, 1), (2, 3)");
+    }
+
+    @Test
+    public void testSubqueryPredicateInOuterJoinIsSymmetricAcrossLeftAndRight()
+    {
+        // The subquery operand references the left side, while the whole ON expression also references the
+        // right side. The subquery must follow its operand, not the mixed expression.
+        assertThat(assertions.query("SELECT t.x AS tx, u.x AS ux FROM (VALUES 1, 2) t(x) LEFT JOIN (VALUES 1, 3) u(x) ON t.x IN (VALUES 2) OR u.x = 1"))
+                .matches("VALUES (1, 1), (2, 1), (2, 3)");
+
+        assertThat(assertions.query("SELECT t.x AS tx, u.x AS ux FROM (VALUES 1, 2) t(x) RIGHT JOIN (VALUES 1, 3) u(x) ON t.x IN (VALUES 2) OR u.x = 1"))
+                .matches("VALUES (1, 1), (2, 1), (2, 3)");
+
+        // The mirrored predicate referencing the right side keeps working for both join directions.
+        assertThat(assertions.query("SELECT t.x AS tx, u.x AS ux FROM (VALUES 1, 2) t(x) LEFT JOIN (VALUES 1, 3) u(x) ON u.x IN (VALUES 3) OR t.x = 1"))
+                .matches("VALUES (1, 1), (1, 3), (2, 3)");
+
+        assertThat(assertions.query("SELECT t.x AS tx, u.x AS ux FROM (VALUES 1, 2) t(x) RIGHT JOIN (VALUES 1, 3) u(x) ON u.x IN (VALUES 3) OR t.x = 1"))
+                .matches("VALUES (1, 1), (1, 3), (2, 3)");
+
+        // A quantified comparison behaves the same as an IN predicate.
+        assertThat(assertions.query("SELECT t.x AS tx, u.x AS ux FROM (VALUES 1, 2) t(x) LEFT JOIN (VALUES 1, 3) u(x) ON t.x = ANY (VALUES 2) OR u.x = 1"))
+                .matches("VALUES (1, 1), (2, 1), (2, 3)");
+
+        assertThat(assertions.query("SELECT t.x AS tx, u.x AS ux FROM (VALUES 1, 2) t(x) RIGHT JOIN (VALUES 1, 3) u(x) ON t.x = ANY (VALUES 2) OR u.x = 1"))
+                .matches("VALUES (1, 1), (2, 1), (2, 3)");
+    }
+
+    @Test
+    public void testSubqueryPredicateOperandReferencingBothSidesIsRejected()
+    {
+        // Operand mixes columns from both sides within a single predicate: it cannot be evaluated on either
+        // branch below the join.
+        assertThat(assertions.query("SELECT * FROM (VALUES 1, 2) t(x) LEFT JOIN (VALUES 1, 3) u(x) ON t.x + u.x IN (SELECT x FROM (VALUES 2, 5) v(x))"))
+                .failure().hasMessageMatching("line 1:70: Subquery predicate in LEFT JOIN criteria has an operand referencing both sides of the join.*");
+
+        assertThat(assertions.query("SELECT * FROM (VALUES 1, 2) t(x) RIGHT JOIN (VALUES 1, 3) u(x) ON t.x + u.x IN (SELECT x FROM (VALUES 2, 5) v(x))"))
+                .failure().hasMessageMatching("line 1:71: Subquery predicate in RIGHT JOIN criteria has an operand referencing both sides of the join.*");
+
+        assertThat(assertions.query("SELECT * FROM (VALUES 1, 2) t(x) LEFT JOIN (VALUES 1, 3) u(x) ON t.x IN (VALUES 2) OR u.x IN (VALUES 3)"))
+                .failure().hasMessageMatching(".*Subquery predicates in LEFT JOIN criteria must be resolvable on the same join side, but they reference different sides");
+    }
+
+    @Test
+    public void testLegacyOuterJoinSubqueryPredicateBehavior()
+    {
+        Session legacySession = assertions.sessionBuilder()
+                .setSystemProperty(LEGACY_OUTER_JOIN_SUBQUERY_PREDICATE_BEHAVIOR, "true")
+                .build();
+
+        // With the legacy behavior the whole ON expression is planned on the right side, so the subquery
+        // operand (t.x) cannot be resolved there.
+        assertThat(assertions.query(legacySession, "SELECT * FROM (VALUES 1, 2) t(x) LEFT JOIN (VALUES 1, 3) u(x) ON t.x IN (VALUES 2) OR u.x = 1"))
+                .failure().hasMessageMatching(".*Subquery predicate in LEFT JOIN criteria has an operand that cannot be resolved on the right side of the join, where the join criteria is planned");
+
+        // Previously supported queries keep their old behavior under the fallback.
+        assertThat(assertions.query(legacySession, "SELECT * FROM (VALUES 1, 2, 3) t(x) RIGHT JOIN (VALUES 1, 3) u(x) ON u.x IN (VALUES 1)"))
+                .matches("VALUES (1, 1), (2, 1), (3, 1), (NULL, 3)");
+
+        // The new default plans the same query successfully.
+        assertThat(assertions.query("SELECT * FROM (VALUES 1, 2) t(x) LEFT JOIN (VALUES 1, 3) u(x) ON t.x IN (VALUES 2) OR u.x = 1"))
+                .matches("VALUES (1, 1), (2, 1), (2, 3)");
     }
 
     @Test
@@ -335,7 +399,7 @@ public class TestJoin
                 .matches("VALUES (1, 3), (2, 1), (2, 3)");
 
         assertThat(assertions.query("SELECT * FROM (VALUES 1, 2, NULL) t(x) RIGHT JOIN (VALUES 1, 3, NULL) u(x) ON t.x + u.x > ALL (VALUES 1)"))
-                .failure().hasMessage("line 1:83: Subquery predicate in RIGHT JOIN criteria involving both sides of the join is not supported");
+                .failure().hasMessageMatching("line 1:83: Subquery predicate in RIGHT JOIN criteria has an operand referencing both sides of the join.*");
     }
 
     @Test

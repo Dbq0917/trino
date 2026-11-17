@@ -229,6 +229,7 @@ public final class SystemSessionProperties
     public static final String DEBUG_ADAPTIVE_PLANNER = "debug_adaptive_planner";
     public static final String SOURCE_PAGES_VALIDATION_ENABLED = "output_pages_validation_enabled";
     public static final String SPOOLING_UNSUPPORTED_WARNING = "spooling_unsupported_warning";
+    public static final String LEGACY_OUTER_JOIN_SUBQUERY_PREDICATE_BEHAVIOR = "legacy_outer_join_subquery_predicate_behavior";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -1193,6 +1194,11 @@ public final class SystemSessionProperties
                                 throw new TrinoException(INVALID_SESSION_PROPERTY, format("%s cannot be set when spooling is disabled", SPOOLING_UNSUPPORTED_WARNING));
                             }
                         },
+                        false),
+                booleanProperty(
+                        LEGACY_OUTER_JOIN_SUBQUERY_PREDICATE_BEHAVIOR,
+                        "Use the legacy behavior for subquery predicates in outer join criteria: plan them on a fixed join side and reject queries whose subquery operand references the other side. When disabled, subquery predicates are planned on the join side that can resolve their operand, so equivalent LEFT and RIGHT JOIN queries are handled consistently",
+                        false,
                         false));
     }
 
@@ -2113,5 +2119,10 @@ public final class SystemSessionProperties
     public static boolean isSpoolingUnsupportedWarningEnabled(Session session)
     {
         return session.getSystemProperty(SPOOLING_UNSUPPORTED_WARNING, Boolean.class);
+    }
+
+    public static boolean isLegacyOuterJoinSubqueryPredicateBehavior(Session session)
+    {
+        return session.getSystemProperty(LEGACY_OUTER_JOIN_SUBQUERY_PREDICATE_BEHAVIOR, Boolean.class);
     }
 }
